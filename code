@@ -1,0 +1,532 @@
+import logging
+import os
+
+import pandas as pd
+import sentry_sdk
+import whois
+from flask import Flask, jsonify, request
+from marshmallow import Schema, ValidationError, fields
+from sentry_sdk.integrations.flask import FlaskIntegration
+
+import apps.funds_suggestion as rate_fund_CL
+import apps.InvoiceRiskFuncionsCL as risk_CL
+import apps.ScoreFunctionsCL as score_func_CL
+import apps.ScoreFunctionsMX as score_func_MX
+from apps import auto_rate, operation_cost
+from lib.exceptions import (
+    InvoiceDoesNotExist,
+    InvoiceDoesNotExistScore,
+    InvoiceDoesNotHaveBusinessId,
+    InvoiceDoesNotHaveIssuerIdentifier,
+    InvoiceDoesNotHavePayerIdentifier,
+    InvoiceEmptyIssuedDateError,
+    OrderTypeInvalid,
+)
+from services.aws_s3_service import (
+    EMAIL_MODEL_NAME,
+    RISK_MODEL_NAME,
+    email_model,
+    risk_model,
+)
+
+sentry_sdk.init(
+    dsn=os.environ["SENTRY_DSN"] if "SENTRY_DSN" in os.environ else None,
+    integrations=[FlaskIntegration()],
+    # Set traces_sample_rate to 1.0 to capture 100%
+    # of transactions for performance monitoring.
+    # We recommend adjusting this value in production.
+    traces_sample_rate=0.1,
+    # By default the SDK will try to use the SENTRY_RELEASE
+    # environment variable, or infer a git commit
+    # SHA as release, however you may want to set
+    # something more human-readable.
+    # release="myapp@1.0.0",
+)
+
+
+class PymeSchema(Schema):
+    issuedInvoicesAmount = fields.Number(required=True)
+    canceledInvoicesAmount = fields.Number(required=True)
+    claimedInvoicesAmount = fields.Number(required=True)
+    spread3m = fields.Number(required=True)
+
+
+class PayerSchema(Schema):
+    payerRanking = fields.Number(required=True)
+    hasPayerAnActivePPAgreement = fields.Boolean(required=True)
+
+
+class InvoiceSchema(Schema):
+    hasTheInvoiceMerit = fields.Boolean(required=True)
+    percentageOfAmountOverMonthlySales = fields.Number(required=True)
+    daysFromIssue = fields.Number(required=True)
+
+
+class RelationshipSchema(Schema):
+    percentageOfCessions = fields.Number(required=True)
+    percentageOfCreditNotesOnAverageMonthlySales = fields.Number(required=True)
+    invoicesNumber = fields.Number(required=True)
+    paidOnTimeInvoices = fields.Number(required=True)
+    percentageOfCanceledInvoices = fields.Number(required=True)
+
+
+class RiskSchema(Schema):
+    siiFacturaId = fields.Int(required=True)
+    pyme = fields.Nested(PymeSchema())
+    payer = fields.Nested(PayerSchema())
+    invoice = fields.Nested(InvoiceSchema())
+    relationship = fields.Nested(RelationshipSchema())
+
+
+class EmailRiskSchema(Schema):
+    email = fields.Str(required=True)
+
+
+class AutoRateSchema(Schema):
+    invoiceId = fields.Int(required=True)
+    country = fields.String(required=True)
+    type = fields.String(required=True)  # noqa: A003
+
+
+class OperationCostSchema(Schema):
+    country = fields.String(required=True)
+    type = fields.String(required=True)  # noqa: A003
+    transfer_amount = fields.Number(required=True)
+    is_financed = fields.Boolean(load_default=True)
+
+
+class InvoiceRiskSchema(Schema):
+    invoiceId = fields.Int(required=True)
+    country = fields.String(required=True)
+
+
+class ScoreOrderSchema(Schema):
+    orderId = fields.Int(required=True)
+    country = fields.String(required=True)
+    payerIdentifier = fields.String(required=True)
+
+
+class ScoreInvoiceSchema(Schema):
+    invoiceId = fields.Int(required=True)
+    country = fields.String(required=True)
+
+
+class FundSuggestionSchema(Schema):
+    rut_pagador = fields.String(required=True)
+    rut_emisor = fields.String(required=True)
+    monto = fields.Number(required=True)
+    score = fields.Number(required=True)
+    tasa_originacion = fields.Number(required=True)
+
+
+class FundRateSuggestionSchema(Schema):
+    rut_pagador = fields.String(required=True)
+    rut_emisor = fields.String(required=True)
+    monto = fields.Number(required=True)
+    score = fields.Number(required=True)
+    tasa_originacion = fields.Number(required=True)
+    fondo_id = fields.Int(required=True)
+
+
+application = Flask(__name__)
+
+logging.basicConfig(level=logging.INFO)
+
+
+ALLOWED_COUNTRIES = ["MX", "CL"]
+
+
+@application.route("/status")
+def status():
+    response = {"status": "success", "message": "ML Invoice is running!"}
+    return jsonify(response)
+
+
+@application.route("/invoice-risk", methods=["POST"])
+def InvoiceRisk():
+    schema = InvoiceRiskSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    invoice_id = result["invoiceId"]
+    country = result["country"]
+
+    if country not in ALLOWED_COUNTRIES + ["CL"]:
+        msg = "country not available"
+        return jsonify({"message": msg}), 400
+
+    pklmodel = RISK_MODEL_NAME
+    if country == "CL":
+        try:
+            probability = risk_CL.calculate_risk_probability(invoice_id)
+            level = (
+                "LOW"
+                if probability < 0.4
+                else "MEDIUM"
+                if probability < 0.8
+                else "HIGH"
+            )
+        except Exception as e:
+            print("invoiceId", invoice_id, " Error", e)
+            probability = None
+            level = None
+
+    if country == "MX":
+        pklmodel = "Model-constant"
+        probability = 0.8
+        level = (
+            "LOW" if probability < 0.1 else "MEDIUM" if probability < 0.3 else "HIGH"
+        )
+
+    response = {
+        "invoiceId": invoice_id,
+        "country": country,
+        "probability": probability,
+        "level": level,
+        "ModelName": pklmodel,
+    }
+
+    return jsonify(response)
+
+
+@application.route("/risk", methods=["POST"])
+def XepelinRisk():
+    schema = RiskSchema()
+    try:
+        result = schema.load(request.json)
+        application.logger.info("REQUEST ---> %s", result)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+    try:
+        pyme = result["pyme"]
+        payer = result["payer"]
+        invoice = result["invoice"]
+        relationship = result["relationship"]
+
+        f_a = pyme["canceledInvoicesAmount"] / pyme["issuedInvoicesAmount"]
+        f_r = pyme["claimedInvoicesAmount"] / pyme["issuedInvoicesAmount"]
+
+        data_frame = {
+            "perc_c": relationship["percentageOfCessions"],
+            "perc_nc": relationship["percentageOfCreditNotesOnAverageMonthlySales"],
+            "monto_ventas": invoice["percentageOfAmountOverMonthlySales"],
+            "dias_emsion": invoice["daysFromIssue"],
+            "ranking": payer["payerRanking"],
+            "Facturas Anuladas": f_a,
+            "Facturas Reclamadas": f_r,
+            "Facturas Xepelin Numero Relacion": relationship["invoicesNumber"],
+            "Operaciones pagadas a tiempo relacion": relationship["paidOnTimeInvoices"],
+            "Tasa Cancelamiento": relationship["percentageOfCanceledInvoices"],
+            "Spread ventas mes 3": pyme["spread3m"],
+            "PP_activo": payer["hasPayerAnActivePPAgreement"],
+            "merito": invoice["hasTheInvoiceMerit"],
+        }
+
+        factura = pd.DataFrame(data=data_frame, index=[0])
+        probability = risk_model.predict_proba(factura)[:, 1]
+        response = {
+            "message": "success",
+            "pklmodel": RISK_MODEL_NAME,
+            "probability": float(probability[0]),
+        }
+        return jsonify(response)
+    except Exception as e:
+        msg = "Error calculating probability"
+        return jsonify({"message": msg, "error": e})
+
+
+@application.route("/emailRisk", methods=["POST"])
+def EmailRisk():
+    schema = EmailRiskSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    # get data from whois
+    try:
+        # get domain
+        domain = result["email"].split("@")[1]
+        responseWhois = whois.whois(domain)
+
+        # get first value from list type
+        data = {}
+        for key, value in responseWhois.items():
+            if type(value) == list:
+                data[key] = value[0]
+            else:
+                data[key] = value
+
+        # generate df
+        df = pd.DataFrame([data])
+
+        # variables related to date
+        if (
+            ("creation_date" in df.columns)
+            and ("expiration_date" in df.columns)
+            and (df["creation_date"].values is not None)
+            and (df["expiration_date"].values is not None)
+        ):
+            df["life"] = df["expiration_date"] - df["creation_date"]
+            df["days"] = df["life"].dt.days
+            df["untilNow"] = -(
+                df["creation_date"] - pd.Timestamp.now().normalize()
+            ).dt.days
+        else:
+            df["life"] = 0
+            df["days"] = 0
+            df["untilNow"] = 0
+
+        # variables related to status
+        if "status" in df.columns:
+            df["status"] = (
+                df["status"]
+                .str.upper()
+                .str.split(" ")
+                .apply(lambda x: x[0] if x is not None and type(x) != float else x)
+            )
+        else:
+            df["status"] = None
+
+        # variables 0:absent 1 present
+        columnsPresence = list(df.columns)
+        removeColumns = ["status", "days", "untilNow", "life"]
+        for col in removeColumns:
+            if col in columnsPresence:
+                columnsPresence.remove(col)
+
+        presenceDF = df[columnsPresence]
+        presenceDF = (~presenceDF.isna()).replace(True, 1).replace(False, 0)
+
+        # Other variables
+        othersVarsDF = df[["status", "days", "untilNow"]]
+
+        # Union status getdummies & othersVariables & presenceDF
+        DfModel = pd.concat(
+            [
+                pd.get_dummies(othersVarsDF["status"]),
+                df[["days", "untilNow"]],
+                presenceDF,
+            ],
+            axis=1,
+        )
+
+        # columns required
+        X = [
+            "registrar_url",
+            "updated_date",
+            "registrant_name",
+            "days",
+            "untilNow",
+            "name",
+            "whois_server",
+            "state",
+            "address",
+            "emails",
+            "CLIENTTRANSFERPROHIBITED",
+            "dnssec",
+            "CLIENTDELETEPROHIBITED",
+            "org",
+            "country",
+            "OK",
+            "zipcode",
+            "city",
+            "CLIENTRENEWPROHIBITED",
+            "tech_name",
+        ]
+
+        # fill absent columns with 0
+        for col in X:
+            if col not in DfModel.columns:
+                DfModel[col] = 0
+
+        X_data = DfModel[X]
+
+        # predict
+        probFraud = email_model.predict_proba(X_data)[0][1]
+        response = {
+            "message": "success",
+            "pklmodel": EMAIL_MODEL_NAME,
+            "probability": probFraud,
+        }
+        return jsonify(response)
+
+    except Exception as e:
+        msg = "Error calculating probability"
+        return jsonify({"message": msg, "error": str(e)})
+
+
+@application.route("/auto-rate", methods=["POST"])
+def get_invoice_rate():
+    schema = AutoRateSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    invoice_id = result["invoiceId"]
+    country = result["country"]
+    order_type = result["type"]
+
+    if country not in ALLOWED_COUNTRIES:
+        msg = "country not available"
+        return jsonify({"message": msg}), 400
+
+    try:
+        rate = auto_rate.get_invoice_rate(country, invoice_id, order_type)
+    except InvoiceDoesNotExist:
+        msg = "Invoice ID does not exist"
+        return jsonify({"message": msg}), 400
+
+    response = {"invoiceId": invoice_id, "rate": rate, "type": order_type}
+    return jsonify(response)
+
+
+@application.route("/operation-cost", methods=["POST"])
+def get_operation_cost():
+    schema = OperationCostSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    country = result["country"]
+    order_type = result["type"]
+    transfer_amount = result["transfer_amount"]
+    is_financed = result["is_financed"]
+
+    if country not in ALLOWED_COUNTRIES:
+        msg = "country not available"
+        return jsonify({"message": msg}), 400
+
+    try:
+        cost = operation_cost.get_operation_cost(
+            country, order_type, transfer_amount, is_financed
+        )
+    except OrderTypeInvalid:
+        msg = "Order Type does not exist"
+        return jsonify({"message": msg}), 400
+
+    response = {"operation_cost": cost}
+    return jsonify(response)
+
+
+@application.route("/score-order", methods=["POST"])
+def scoreOrder():
+
+    schema = ScoreOrderSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    print(result)
+
+    orderId = result["orderId"]
+    country = result["country"]
+    payerIdentifier = result["payerIdentifier"]
+
+    if country == "CL":
+        diccionario = score_func_CL.calculate_score_final_order_CL(
+            orderId, payerIdentifier
+        )
+    elif country == "MX":
+        diccionario = score_func_MX.calculate_score_final_order_MX(
+            orderId, payerIdentifier
+        )
+    else:
+        msg = "country not available"
+        return jsonify({"message": msg}), 400
+
+    return jsonify(diccionario), 200
+
+
+@application.route("/score-invoice", methods=["POST"])
+def scoreInvoice():
+
+    schema = ScoreInvoiceSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    invoiceId = int(result["invoiceId"])
+    country = result["country"]
+
+    if country not in ["CL", "MX"]:
+        msg = "country not available"
+        return jsonify({"message": msg}), 400
+
+    country_score_calculator = {
+        "MX": score_func_MX.calculate_score_final_invoice_MX,
+        "CL": score_func_CL.calculate_score_final_invoice_CL,
+    }
+
+    try:
+        diccionario = country_score_calculator[country](invoiceId)
+    except InvoiceDoesNotExistScore as e:
+        return jsonify({"message": str(e)}), 404
+    except (
+        InvoiceEmptyIssuedDateError,
+        InvoiceDoesNotHaveBusinessId,
+        InvoiceDoesNotHaveIssuerIdentifier,
+        InvoiceDoesNotHavePayerIdentifier,
+    ) as e:
+        return jsonify({"message": str(e)}), 422
+    except Exception:
+        msg = "internal server error"
+        return jsonify({"message": msg}), 500
+
+    return jsonify(diccionario), 200
+
+
+@application.route("/rate-suggestion", methods=["POST"])
+def rate_suggestion():
+    response = {"fondo_id": 0, "rate": 3.0}
+    return jsonify(response), 200
+
+
+@application.route("/fund-suggestion", methods=["POST"])
+def fund_suggestion():
+    schema = FundSuggestionSchema()
+    try:
+        result = schema.load(request.json)
+    except ValidationError as err:
+        return jsonify(err.messages), 400
+
+    business_size = pd.DataFrame(
+        {
+            "index": [
+                "GRAN EMPRESA",
+                "MEDIANA EMPRESA",
+                "MICRO EMPRESA",
+                "PEQUENA EMPRESA",
+                "PERSONA",
+                "SIN INFORMACIÓN",
+            ],
+            "Porcentaje": [1, 0.5, 0.05, 0.05, 0.01, 0.03],
+        }
+    )
+
+    rut_pagador = result.get("rut_pagador").upper()
+    rut_emisor = result.get("rut_emisor").upper()
+    monto = result.get("monto")
+    score = result.get("score")
+    tasa_originacion = result.get("tasa_originacion")
+
+    response = rate_fund_CL.fund_rate_suggestion(
+        rut_pagador=rut_pagador,
+        rut_emisor=rut_emisor,
+        monto=monto,
+        tasa_originacion=tasa_originacion,
+        score=score,
+        businesses_size=business_size,
+    )
+    return jsonify(response), 200
+
+
+# run the app.
+if __name__ == "__main__":
+    application.run(host="0.0.0.0", port=3333)
